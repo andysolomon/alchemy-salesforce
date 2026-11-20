@@ -1,6 +1,7 @@
-import { Resource, type Resource as ResourceInstance } from "alchemy";
+import { Resource, Stack, type Resource as ResourceInstance } from "alchemy";
 import { isResolved } from "alchemy/Diff";
 import * as Provider from "alchemy/Provider";
+import { State, isActionState } from "alchemy/State";
 import * as Effect from "effect/Effect";
 import { request } from "./api.js";
 import {
@@ -90,6 +91,12 @@ export interface ExternalCredentialAttributes {
   readonly masterLabel: string;
   readonly authenticationProtocol: string;
   readonly authenticationProtocolVariant: string | null;
+  /**
+   * Live Salesforce status (`Configured`, `NotConfigured`, …). It is not
+   * desired configuration: binding a secret changes it after this resource
+   * is first written. Plans re-read it and a secret bind writes it back.
+   * A change here does not plan an update and does not PUT the credential.
+   */
   readonly authenticationStatus: string;
   readonly parameters: ReadonlyArray<ExternalCredentialParameter>;
   readonly principals: ReadonlyArray<ExternalCredentialPrincipalAttributes>;
@@ -474,6 +481,133 @@ const drifted = (record: Record<string, unknown>, credential: NormalizedExternal
 const isDuplicate = (error: SalesforceApiError): boolean =>
   error.errorCode === "DUPLICATE_DEVELOPER_NAME" || error.errorCode === "DUPLICATE_VALUE";
 
+const sameOrg = (left: string | undefined, right: string | undefined): boolean =>
+  (left ?? "") === (right ?? "");
+
+/**
+ * Copy live authentication status onto an attribute snapshot.
+ * Credential and principal status change when a secret is bound, which is
+ * after this resource's own reconcile. They are not inputs, so this never
+ * means the credential body drifted.
+ */
+const patchAuthenticationStatus = (
+  attr: ExternalCredentialAttributes,
+  record: Record<string, unknown>,
+): boolean => {
+  const mutable = attr as unknown as {
+    authenticationStatus: string;
+    principals: Array<ExternalCredentialPrincipalAttributes & { authenticationStatus: string | null }>;
+  };
+  let changed = false;
+  const liveStatus = stringField(record, "authenticationStatus");
+  if (liveStatus !== undefined && liveStatus !== attr.authenticationStatus) {
+    mutable.authenticationStatus = liveStatus;
+    changed = true;
+  }
+  const livePrincipals = Array.isArray(record.principals) ? record.principals : [];
+  const principals = attr.principals.map((principal) => {
+    const live = livePrincipals
+      .map((entry) => asRecord(entry))
+      .find((entry) => {
+        if (entry === undefined) {
+          return false;
+        }
+        const id = stringField(entry, "id");
+        return (id !== undefined && id === principal.id) || stringField(entry, "principalName") === principal.principalName;
+      });
+    if (live === undefined) {
+      return principal;
+    }
+    const status = stringField(live, "authenticationStatus") ?? null;
+    if (status === principal.authenticationStatus) {
+      return principal;
+    }
+    changed = true;
+    return { ...principal, authenticationStatus: status };
+  });
+  if (principals.some((principal, index) => principal !== attr.principals[index])) {
+    mutable.principals = principals;
+  }
+  return changed;
+};
+
+const persistAttributes = (fqn: string, attr: ExternalCredentialAttributes) =>
+  Effect.gen(function* () {
+    const stack = yield* Stack;
+    const state = yield* yield* State;
+    const row = yield* state.get({ stack: stack.name, stage: stack.stage, fqn });
+    if (row === undefined || isActionState(row)) {
+      return;
+    }
+    yield* state.set({
+      stack: stack.name,
+      stage: stack.stage,
+      fqn,
+      value: { ...row, attr },
+    });
+  });
+
+/**
+ * Re-read authentication status and write it onto the persisted snapshot.
+ * Returns whether the snapshot changed. Callers keep the plan action as a
+ * noop: this is not a configuration update.
+ */
+const refreshStoredAuthenticationStatus = (
+  fqn: string,
+  attr: ExternalCredentialAttributes,
+  targetOrg: string | undefined,
+) =>
+  Effect.gen(function* () {
+    const connection = yield* connectionFor(targetOrg);
+    const record = yield* findByName(connection, attr.developerName);
+    if (record === undefined || !patchAuthenticationStatus(attr, record)) {
+      return false;
+    }
+    yield* persistAttributes(fqn, attr);
+    return true;
+  });
+
+/**
+ * After a secret bind, copy the live status onto every external credential
+ * row with this developer name and org. The credential resource was
+ * reconciled before the secret existed, so its snapshot still says
+ * `NotConfigured` until this runs.
+ */
+export const publishExternalCredentialAuthenticationStatus = (
+  developerName: string,
+  targetOrg: string | undefined,
+) =>
+  Effect.gen(function* () {
+    const stack = yield* Stack;
+    const state = yield* yield* State;
+    const connection = yield* connectionFor(targetOrg);
+    const record = yield* findByName(connection, developerName);
+    if (record === undefined) {
+      return;
+    }
+    const fqns = yield* state.list({ stack: stack.name, stage: stack.stage });
+    for (const fqn of fqns) {
+      const row = yield* state.get({ stack: stack.name, stage: stack.stage, fqn });
+      if (
+        row === undefined ||
+        isActionState(row) ||
+        row.resourceType !== "Salesforce.ExternalCredential" ||
+        row.attr === undefined
+      ) {
+        continue;
+      }
+      const props = row.props as { developerName?: string; targetOrg?: string } | undefined;
+      if (props?.developerName !== developerName || !sameOrg(props.targetOrg, targetOrg)) {
+        continue;
+      }
+      const attr = row.attr as ExternalCredentialAttributes;
+      if (!patchAuthenticationStatus(attr, record)) {
+        continue;
+      }
+      yield* persistAttributes(fqn, attr);
+    }
+  });
+
 const findByName = (connection: ResolvedConnection, developerName: string) =>
   Effect.gen(function* () {
     const path = externalCredentialsPath(connection.apiVersion, developerName);
@@ -526,14 +660,19 @@ export const ExternalCredentialProvider = Provider.succeed(
     nuke: { skip: true },
     diff: (input) =>
       Effect.gen(function* () {
-        if (!isResolved(input.news) || input.olds === undefined) {
-          return undefined;
-        }
-        if (
-          targetOrgChanged(input.olds.targetOrg, input.news.targetOrg) ||
-          input.olds.developerName !== input.news.developerName
-        ) {
+        const replacing =
+          isResolved(input.news) &&
+          input.olds !== undefined &&
+          (targetOrgChanged(input.olds.targetOrg, input.news.targetOrg) ||
+            input.olds.developerName !== input.news.developerName);
+        if (replacing) {
           return { action: "replace" as const, deleteFirst: true };
+        }
+        // Status is observed, not configured. Refresh the snapshot in place
+        // so a noop plan does not keep the NotConfigured value captured
+        // before ExternalCredentialSecret bound credentials.
+        if (input.output !== undefined && input.olds !== undefined) {
+          yield* refreshStoredAuthenticationStatus(input.fqn, input.output, input.olds.targetOrg);
         }
         return undefined;
       }),
