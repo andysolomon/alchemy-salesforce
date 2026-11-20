@@ -27,7 +27,16 @@ npm install git+https://github.com/andysolomon/alchemy-salesforce.git#<commit-sh
 
 `alchemy`, `effect`, and `@effect/platform-node` are peer dependencies. Keep them on these versions so resource identity and the Effect runtime match.
 
-Pin a commit SHA. This package is private and unpublished. Git has to be able to read the repository (`gh auth setup-git` locally, or a credential helper in CI). npm installs git dependencies by packing a tarball, and that pack runs `prepare`, not `prepack`. `prepare` compiles `src/` to `dist/` (the `files` list ships `dist/`, which is gitignored). Without `prepare`, the installed package has no `dist/index.js`.
+Pin a commit SHA. This package is private and unpublished. npm installs git dependencies by packing a tarball, and that pack runs `prepare`, not `prepack`. `prepare` compiles `src/` to `dist/` (the `files` list ships `dist/`, which is gitignored). Without `prepare`, the installed package has no `dist/index.js`.
+
+npm fetches GitHub git dependencies over SSH (`git+ssh://git@github.com/...`), even when `package.json` says `git+https://`. An SSH key that can read this repository is enough for `npm ci`. If you authenticate with `gh` over HTTPS, point SSH at HTTPS before installing, then let `gh` supply the credential:
+
+```sh
+git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+gh auth setup-git
+```
+
+In CI, `actions/checkout` only authenticates the workflow checkout. Set the same `insteadOf` globally and pass a token that can read this repository (`GITHUB_TOKEN` from another repo cannot).
 
 To work on the provider itself:
 
