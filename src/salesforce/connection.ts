@@ -67,6 +67,19 @@ export const clearConnectionCache = (): void => {
   connectionCache.clear();
 };
 
+/**
+ * Drop cached connections for one alias. A scratch org that is deleted and
+ * recreated under the same alias gets a new instance URL and token.
+ */
+export const forgetConnection = (alias: string): void => {
+  const trimmed = alias.trim();
+  for (const [key, connection] of connectionCache) {
+    if (connection.alias === trimmed || key.startsWith(`${trimmed}\0`)) {
+      connectionCache.delete(key);
+    }
+  }
+};
+
 export const graphqlEndpoint = (instanceUrl: string, apiVersion: string): string =>
   `${instanceUrl}/services/data/v${apiVersion}/graphql`;
 
@@ -112,7 +125,7 @@ export const redactCliText = (text: string, secrets: ReadonlyArray<string> = [])
   return redacted.replaceAll(/Bearer\s+\S+/g, "Bearer [redacted]");
 };
 
-const normalizeInstanceUrl = (instanceUrl: string): string => instanceUrl.replace(/\/+$/, "");
+export const normalizeInstanceUrl = (instanceUrl: string): string => instanceUrl.replace(/\/+$/, "");
 
 const assertInstanceUrl = (instanceUrl: string): Effect.Effect<string, SalesforceAuthError> => {
   if (/^https?:\/\//i.test(instanceUrl)) {
@@ -125,7 +138,7 @@ const assertInstanceUrl = (instanceUrl: string): Effect.Effect<string, Salesforc
   );
 };
 
-const parseJsonObject = (
+export const parseJsonObject = (
   stdout: string,
   secrets: ReadonlyArray<string>,
 ): Effect.Effect<Record<string, unknown>, SalesforceCliError> => {
@@ -160,7 +173,7 @@ const parseJsonObject = (
   }
 };
 
-const resultRecord = (payload: Record<string, unknown>): Record<string, unknown> | undefined => {
+export const resultRecord = (payload: Record<string, unknown>): Record<string, unknown> | undefined => {
   const result = payload.result ?? payload;
   if (result !== null && typeof result === "object" && !Array.isArray(result)) {
     return result as Record<string, unknown>;
@@ -186,7 +199,7 @@ const failCli = (
     ),
   });
 
-const runChecked = <R>(
+export const runChecked = <R>(
   run: CommandRunner<R>,
   args: ReadonlyArray<string>,
   secrets: ReadonlyArray<string>,
@@ -470,6 +483,8 @@ export class OrgDirectory extends Context.Service<
     readonly resolve: (
       targetOrg: string | undefined,
     ) => Effect.Effect<ResolvedConnection, SalesforceAuthError | SalesforceCliError>;
+    /** Run `sf <args>`. Resources that drive the CLI (scratch orgs) use this. */
+    readonly run: CommandRunner;
   }
 >()("salesforce/OrgDirectory") {}
 
@@ -483,6 +498,7 @@ export const OrgDirectoryLive = Layer.effect(
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const run = liveRunner(spawner);
     return {
+      run,
       resolve: (targetOrg) =>
         Effect.gen(function* () {
           const stage = Option.getOrUndefined(yield* Effect.serviceOption(Stage));
@@ -505,6 +521,13 @@ export const OrgDirectoryLive = Layer.effect(
     };
   }),
 );
+
+/** Run `sf <args>` through the process's CLI runner. */
+export const runSf = (args: ReadonlyArray<string>) =>
+  Effect.gen(function* () {
+    const directory = yield* OrgDirectory;
+    return yield* directory.run(args);
+  });
 
 /** Resolve the default org, or `targetOrg` when a resource names one. */
 export const connectionFor = (targetOrg: string | undefined) =>

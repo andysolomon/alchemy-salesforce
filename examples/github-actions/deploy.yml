@@ -1,0 +1,31 @@
+# Apply the same stack to uat, then prod, on every push to main.
+# Add required reviewers to the `prod` environment to gate the second job.
+# Copy to .github/workflows/.
+name: Salesforce deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never run two deploys against the same state at once.
+concurrency:
+  group: salesforce-deploy
+  cancel-in-progress: false
+
+jobs:
+  uat:
+    uses: ./.github/workflows/salesforce-deploy-stage.yml
+    with:
+      stage: uat
+    secrets: inherit
+
+  prod:
+    needs: uat
+    uses: ./.github/workflows/salesforce-deploy-stage.yml
+    with:
+      stage: prod
+    secrets: inherit

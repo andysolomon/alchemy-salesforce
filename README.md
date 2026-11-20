@@ -1,6 +1,8 @@
 # alchemy-salesforce
 
-Alchemy provider for Salesforce org configuration. It manages CSP trusted sites, remote site settings, permission set assignments, external credentials, named credentials, credential secrets, and principal access.
+Alchemy provider for Salesforce org configuration. It manages scratch orgs, CSP trusted sites, CORS allowed origins, remote site settings, permission set and permission set group assignments, external credentials, named credentials, credential secrets, and principal access.
+
+Because Alchemy reads the org back, the same stack also gives you `alchemy drift` for Salesforce: a nightly job can report a trusted site, CORS origin, or credential that someone changed by hand in Setup.
 
 The public surface matches Alchemy's built-in providers: an Effect `Layer` from `providers()`, and resource constructors you `yield*` inside a stack.
 
@@ -81,13 +83,26 @@ Omit `targetOrg` and the resource uses the default connection (`SF_TARGET_ORG`, 
 
 See `examples/single-org.ts` and `examples/multi-org.ts`.
 
+## Examples
+
+| Example | What it shows |
+| --- | --- |
+| [`examples/single-org.ts`](examples/single-org.ts) | One org per stage: trusted site, remote site, permission set assignment |
+| [`examples/multi-org.ts`](examples/multi-org.ts) | Two orgs wired together with OAuth client credentials, without hard-coded URLs |
+| [`examples/scratch-org.ts`](examples/scratch-org.ts) | A disposable scratch org per stage: create it, push source with `Command.Exec`, assign a permission set group, allow a local dev server through CORS |
+| [`examples/salesforce-cloudflare/`](examples/salesforce-cloudflare) | A Cloudflare Worker and the Named Credential that calls it, in one stack. The Worker URL and shared secret never get copied by hand |
+| [`examples/github-actions/`](examples/github-actions) | Workflows: plan on pull requests, deploy uat then prod, nightly drift issues, a scratch org per pull request |
+
 ## Resources
 
 | Resource | Create / update | Delete | Read / list |
 | --- | --- | --- | --- |
 | `Org` | No Salesforce write. Resolves an alias | No-op | The named alias. `list` is empty |
+| `ScratchOrg` | `sf org create scratch` from a Dev Hub. Adopts a live scratch org already under the alias | `sf org delete scratch`, or delete the Dev Hub's `ActiveScratchOrg` row when the alias is not authorized here | `sf org display`, then the Dev Hub. `list` is empty |
 | `CspTrustedSite` | REST sObject `CspTrustedSite` | DELETE that row | SOQL / sObject retrieve |
+| `CorsAllowedOrigin` | REST sObject `CorsWhitelistEntry` | DELETE that row | SOQL / sObject retrieve |
 | `PermissionSetAssignment` | POST an assignment of an existing permission set to an existing user | DELETE that row (unassign) | SOQL. A new user or permission set is a replace |
+| `PermissionSetGroupAssignment` | POST a `PermissionSetAssignment` with `PermissionSetGroupId` | DELETE that row (unassign) | SOQL. A new user or group is a replace. `list` is empty |
 | `RemoteSiteSetting` | Tooling `RemoteProxy` via `FullName` + `Metadata` | DELETE, or deactivate when the API refuses DELETE | Tooling query on `SiteName` |
 | `ExternalCredential` | Connect REST `POST` / `PUT /named-credentials/external-credentials` | DELETE that developer name (404 is already gone) | GET by developer name. `list` is the default org only |
 | `NamedCredential` | Connect REST `POST` / `PUT /named-credentials/named-credential-setup` | DELETE that developer name | GET by developer name. `list` is the default org only |
@@ -103,6 +118,29 @@ const org = yield* Salesforce.Org("Org", { alias: "dev" });
 ```
 
 Outputs: `alias`, `orgId`, `instanceUrl`, `username`, `apiVersion`, `graphqlUrl`. A plan that is a noop because the alias did not change does not call `sf` again. `alchemy deploy --force` reconciles it.
+
+### `ScratchOrg`
+
+Creates a scratch org from a Dev Hub with the Salesforce CLI, and exposes the same outputs as `Org` (`alias`, `orgId`, `instanceUrl`, `username`, `apiVersion`, `graphqlUrl`) plus `devHub`, `expirationDate`, and `edition`. Other resources take `targetOrg: scratch.alias`, which also makes them wait for the org.
+
+```ts
+const scratch = yield* Salesforce.ScratchOrg("Scratch", {
+  alias: "pr-42",
+  devHub: "devhub",
+  definitionFile: "config/project-scratch-def.json",
+  durationDays: 3,
+});
+```
+
+- `definitionFile`, `edition`, `durationDays` (1 to 30, default 7), `noNamespace`, `devHub`, and `alias` are read only at creation. Changing one **replaces** the org: the old one is deleted first. `waitMinutes` (default 10) is not a replacement trigger.
+- With no definition file, the edition defaults to `developer`. With both, `edition` overrides the file, as it does in `sf`.
+- Reconcile adopts a live scratch org already authorized under the alias. It refuses an alias that points at a sandbox or production org (no `devHubId` or `expirationDate` in `sf org display`), so it can never later delete one.
+- An expired org, or one whose refresh token died with it, is logged out and created again.
+- Delete runs `sf org delete scratch` only when the alias still resolves to the org id in state. If the alias was reassigned, the provider logs a warning and leaves that org alone.
+
+**On CI runners.** A runner that did not create the org has no local login for the alias. Destroy then deletes the Dev Hub's `ActiveScratchOrg` row, which deletes the org, so closing a pull request cleans up even on a fresh runner. Redeploy checks the Dev Hub first and, if the org is still active, logs back in with `sf org login jwt` using `SF_JWT_CLIENT_ID` and `SF_JWT_KEY_FILE` (the Dev Hub connected app's consumer key and private key; `SF_JWT_INSTANCE_URL` defaults to `https://test.salesforce.com`). Without those it fails with instructions rather than creating a second org.
+
+Pushing source is not this provider's job. `examples/scratch-org.ts` runs `sf project deploy start` with Alchemy's `Command.Exec`, and feeds its output into later resources so they wait for the deploy.
 
 ### `CspTrustedSite`
 
@@ -123,6 +161,34 @@ const trustedSite = yield* Salesforce.CspTrustedSite("ExampleSite", {
 ```
 
 Camera and microphone permission-policy fields are not managed.
+
+### `CorsAllowedOrigin`
+
+Setup's CORS allowed origin list, which lets browser JavaScript on that origin call the org's REST APIs. The sObject is `CorsWhitelistEntry`. An existing row with the same developer name is adopted and patched.
+
+`urlPattern` is an origin, not a URL with a path. Salesforce requires HTTPS except for localhost. A leading wildcard subdomain is allowed. A trailing slash is removed. Anything else is rejected before a request is sent.
+
+```ts
+yield* Salesforce.CorsAllowedOrigin("LocalDev", {
+  targetOrg: org.alias,
+  name: "Local_Dev_Server",
+  urlPattern: "http://localhost:5173", // or https://*.example.com
+});
+```
+
+### `PermissionSetGroupAssignment`
+
+Assigns an **existing** permission set group to an **existing** user: a `PermissionSetAssignment` row with `PermissionSetGroupId` set. The group is matched on `DeveloperName` plus optional `NamespacePrefix`. A group whose `Status` is `Failed` is reported before any write. Changing the user or group is a replace.
+
+```ts
+yield* Salesforce.PermissionSetGroupAssignment("SalesOps", {
+  targetOrg: org.alias,
+  permissionSetGroup: "Sales_Ops",
+  username,
+});
+```
+
+`list` is empty: assignment rows carry no Alchemy ownership tag.
 
 ### `PermissionSetAssignment`
 
@@ -280,6 +346,21 @@ A principal that has never had secrets still answers GET with **200**. The body 
 
 The provider treats "no stored credentials" as a create and **POSTs**. If a PUT still fails with a message such as "no existing authentication credentials" or "use the post method to create", it POSTs instead of failing the stack. A duplicate response is adopted. After the write, the provider reads the credential back and fails if Salesforce stored a different value. The failure message does not include the secret.
 
+## Drift detection
+
+Every resource implements `read`, so `alchemy drift` compares each org with the last deploy:
+
+```sh
+npx alchemy drift --stage prod                  # report only. Exit code 2 means drift was found
+npx alchemy drift --stage prod --repair --yes   # put the org back to the deployed state
+```
+
+`--yes` answers the repair prompt, so leave it off a report-only job. A row deleted in Setup is reported as `missing` and recreated on repair. [`examples/github-actions/drift.yml`](examples/github-actions/drift.yml) runs the check nightly and opens an issue.
+
+## CI/CD
+
+[`examples/github-actions/`](examples/github-actions) has workflows to copy into `.github/workflows/`: plan on pull requests, deploy uat then prod on merge, a nightly drift check, and a scratch org per pull request. CI needs remote state, because each run starts on a clean machine. The workflows assume `Cloudflare.state()`. Any remote Alchemy state store works.
+
 ## Salesforce API gotchas
 
 These showed up against live API 66 and 68 and are enforced in the provider:
@@ -295,6 +376,9 @@ These showed up against live API 66 and 68 and are enforced in the provider:
 - **Alias isolation.** `targetOrg` does not reuse `SF_ACCESS_TOKEN` from a different org. Use `SF_ORG_CREDENTIALS` in CI when one process talks to several orgs.
 - **List scope.** CSP, assignment, remote site, external credential, and named credential `list` read the **default** org only. Secret and principal-access `list` are empty. Nuke stays skipped so a mesh cannot wipe every credential in an org.
 - **SOQL.** String literals are escaped, including quotes. This is not a general SOQL builder.
+- **CORS object name.** Setup's "CORS Allowed Origins" is the `CorsWhitelistEntry` sObject (`UrlPattern`, `DeveloperName`, `MasterLabel`). The metadata type is `CorsWhitelistOrigin`.
+- **Permission set groups** are assigned with the same `PermissionSetAssignment` sObject, using `PermissionSetGroupId` instead of `PermissionSetId`.
+- **Scratch org cleanup.** Deleting the Dev Hub's `ActiveScratchOrg` row deletes the scratch org. Its `ScratchOrg` field is the 15-character org id.
 - **Permission set definitions** are not created here. Tooling `PermissionSet` does not support create. Deploy the definition with `sf project deploy`, and use this provider to assign it.
 
 ## When to use `sf project deploy` instead
@@ -316,3 +400,4 @@ When the alias and the stage name differ, set `SF_TARGET_ORG` and still pass a s
 - Remote-site DELETE is not in the published Tooling API. Destroy may deactivate instead of delete. The mock covers that fallback.
 - Credential values exist only in process memory for the apply. A crash before the write leaves Salesforce unchanged and leaves nothing secret on disk. A crash after the write still has only the digest in state.
 - This package does not deploy Apex, permission set definitions, or legacy named credentials.
+- `ScratchOrg` needs the `sf` CLI and an authorized Dev Hub, even when other resources use `SF_ORG_CREDENTIALS`. Scratch org limits are the Dev Hub's: a replacement deletes the old org before creating the new one.

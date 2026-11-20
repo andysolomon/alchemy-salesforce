@@ -151,7 +151,7 @@ const attributesFrom = (
 const queryOne = (connection: ResolvedConnection, soql: string) =>
   Effect.map(queryRecords(connection, soql), (records) => records[0]);
 
-const requireUser = (connection: ResolvedConnection, username: string) =>
+export const requireUser = (connection: ResolvedConnection, username: string) =>
   Effect.gen(function* () {
     const records = yield* queryRecords(
       connection,

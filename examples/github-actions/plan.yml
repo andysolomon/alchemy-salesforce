@@ -1,0 +1,53 @@
+# Plan every environment on each pull request, so reviewers see the
+# Salesforce changes next to the code. Copy to .github/workflows/.
+name: Salesforce plan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan (${{ matrix.stage }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [uat, prod]
+    # One GitHub environment per stage holds that org's login.
+    environment: ${{ matrix.stage }}
+    env:
+      STAGE: ${{ matrix.stage }}
+      # Remote state, shared with deploy and drift. See README.md.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm install --global @salesforce/cli
+      - name: Authorize the org (JWT)
+        env:
+          SF_JWT_KEY: ${{ secrets.SF_JWT_KEY }}
+          SF_CLIENT_ID: ${{ vars.SF_CLIENT_ID }}
+          SF_USERNAME: ${{ vars.SF_USERNAME }}
+          SF_LOGIN_URL: ${{ vars.SF_LOGIN_URL }}
+        run: |
+          printf '%s' "$SF_JWT_KEY" > "$RUNNER_TEMP/server.key"
+          sf org login jwt --username "$SF_USERNAME" --client-id "$SF_CLIENT_ID" \
+            --jwt-key-file "$RUNNER_TEMP/server.key" --instance-url "${SF_LOGIN_URL:-https://login.salesforce.com}" \
+            --alias "$STAGE"
+      - name: Plan
+        run: |
+          npx alchemy plan --stage "$STAGE" --no-input | tee plan.txt
+          {
+            echo "### Salesforce plan: \`$STAGE\`"
+            echo '```'
+            cat plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
