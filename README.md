@@ -22,10 +22,12 @@ This package is not published. From an app that already depends on Alchemy:
 
 ```sh
 npm install alchemy@2.0.0-beta.87 effect@4.1.4 @effect/platform-node@4.1.4
-npm install github:andysolomon/alchemy-salesforce
+npm install git+https://github.com/andysolomon/alchemy-salesforce.git#<commit-sha>
 ```
 
 `alchemy`, `effect`, and `@effect/platform-node` are peer dependencies. Keep them on these versions so resource identity and the Effect runtime match.
+
+Pin a commit SHA. This package is private and unpublished. Git has to be able to read the repository (`gh auth setup-git` locally, or a credential helper in CI). npm installs git dependencies by packing a tarball, and that pack runs `prepare`, not `prepack`. `prepare` compiles `src/` to `dist/` (the `files` list ships `dist/`, which is gitignored). Without `prepare`, the installed package has no `dist/index.js`.
 
 To work on the provider itself:
 
