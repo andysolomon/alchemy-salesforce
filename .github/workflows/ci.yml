@@ -17,4 +17,9 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - run: npm run build
+      - name: prepare emits the git-install entrypoint
+        run: |
+          rm -rf dist
+          npm run prepare
+          test -f dist/index.js
+          test -f dist/index.d.ts
