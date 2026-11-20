@@ -166,6 +166,8 @@ export default Stack(
       externalCredential: external.developerName,
       restBaseCallout: named.restBaseCallout,
       graphqlCallout: named.graphqlCallout,
+      // Refreshed after the secret binds. A later plan that only re-reads this
+      // status stays a noop and does not PUT the external credential.
       authenticationStatus: external.authenticationStatus,
       principalAccessId: access.id,
     };

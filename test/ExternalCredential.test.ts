@@ -1,7 +1,10 @@
 import * as Test from "@alchemy.run/test/Vitest";
+import { Stack } from "alchemy";
+import { State, isResourceState } from "alchemy/State";
 import { afterAll, beforeAll, beforeEach, expect } from "vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Redacted from "effect/Redacted";
 import * as Salesforce from "../src/salesforce/index.js";
 import { clearCredentialSecrets } from "../src/salesforce/credentialSecrets.js";
 import { bindMockOrg } from "./harness.js";
@@ -92,7 +95,12 @@ test.provider("creates an OAuth external credential with PUT updates and a noop 
       }),
     );
     expect(Object.values(planned.resources).every((resource) => resource.action === "noop")).toBe(true);
-    expect(org.requests.length).toBe(before);
+    const refreshReads = org.requests.slice(before);
+    expect(refreshReads.length).toBeGreaterThan(0);
+    expect(refreshReads.every((request) => request.method === "GET" && request.resource === "external-credentials")).toBe(
+      true,
+    );
+    expect(puts()).toHaveLength(1);
 
     yield* stack.destroy();
     expect(org.externalCredentials()).toEqual([]);
@@ -215,6 +223,84 @@ test.provider("replaces the credential when the developer name changes", (stack)
     if (replacement?.action === "replace") {
       expect(replacement.deleteFirst).toBe(true);
     }
+  }),
+);
+
+test.provider("refreshes authenticationStatus after a secret bind without planning an update", (stack) =>
+  Effect.gen(function* () {
+    const program = Effect.gen(function* () {
+      const credential = yield* Salesforce.ExternalCredential("Partner", external());
+      const secret = yield* Salesforce.ExternalCredentialSecret("PartnerSecret", {
+        externalCredential: credential.developerName,
+        principalName: "PartnerPrincipal",
+        principalType: "NamedPrincipal",
+        credentials: {
+          clientId: { value: Redacted.make("consumer-key"), encrypted: false },
+          clientSecret: { value: Redacted.make("consumer-secret-value"), encrypted: true },
+        },
+      });
+      return {
+        externalStatus: credential.authenticationStatus,
+        principalStatus: credential.principals[0]?.authenticationStatus,
+        secretStatus: secret.authenticationStatus,
+      };
+    });
+
+    const created = yield* stack.deploy(program);
+    expect(created.secretStatus).toBe("Configured");
+    expect(created.externalStatus).toBe("Configured");
+    expect(created.principalStatus).toBe("Configured");
+    expect(puts()).toHaveLength(0);
+
+    const spec = yield* Stack;
+    const state = yield* yield* State;
+    const fqns = yield* state.list({ stack: spec.name, stage: spec.stage });
+    let stamped = false;
+    for (const fqn of fqns) {
+      const row = yield* state.get({ stack: spec.name, stage: spec.stage, fqn });
+      if (!isResourceState(row) || row.resourceType !== "Salesforce.ExternalCredential" || row.attr === undefined) {
+        continue;
+      }
+      const attr = row.attr as {
+        authenticationStatus: string;
+        principals: Array<{ authenticationStatus: string | null }>;
+      };
+      attr.authenticationStatus = "NotConfigured";
+      const principal = attr.principals[0];
+      if (principal !== undefined) {
+        principal.authenticationStatus = "NotConfigured";
+      }
+      yield* state.set({ stack: spec.name, stage: spec.stage, fqn, value: row });
+      stamped = true;
+    }
+    expect(stamped).toBe(true);
+
+    const before = org.requests.length;
+    const planned = yield* stack.plan(program);
+    expect(Object.values(planned.resources).every((resource) => resource.action === "noop")).toBe(true);
+    const externalNode = Object.values(planned.resources).find(
+      (resource) => resource.resource.Type === "Salesforce.ExternalCredential",
+    );
+    expect(externalNode?.action).toBe("noop");
+    if (externalNode?.action === "noop") {
+      const attr = externalNode.state.attr as {
+        authenticationStatus?: string;
+        principals?: ReadonlyArray<{ authenticationStatus?: string | null }>;
+      };
+      expect(attr.authenticationStatus).toBe("Configured");
+      expect(attr.principals?.[0]?.authenticationStatus).toBe("Configured");
+    }
+    const duringPlan = org.requests.slice(before);
+    expect(duringPlan.every((request) => request.method === "GET")).toBe(true);
+    expect(duringPlan.some((request) => request.resource === "external-credentials")).toBe(true);
+    expect(puts()).toHaveLength(0);
+
+    const again = yield* stack.deploy(program);
+    expect(again.externalStatus).toBe("Configured");
+    expect(again.principalStatus).toBe("Configured");
+    expect(again.secretStatus).toBe("Configured");
+    expect(puts()).toHaveLength(0);
+    expect(posts()).toHaveLength(1);
   }),
 );
 

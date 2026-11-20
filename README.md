@@ -171,6 +171,8 @@ OAuth client credentials need `{ parameterName: "AuthProviderUrl", parameterType
 
 Changing `targetOrg` or the developer name replaces the row (delete first). A second plan with the same props is a noop. Delete treats HTTP 404 as already gone.
 
+`authenticationStatus` (and each principal's status) is observed, not configured. The credential is created before `ExternalCredentialSecret` binds values, so the first write often records `NotConfigured`. Binding the secret copies the live status back onto that snapshot. Later plans GET the credential and, when Salesforce now reports `Configured`, write that into state. The plan action stays **noop**. A status change does not PUT the credential. `ExternalCredentialSecret.authenticationStatus` is the status from the credential bind itself.
+
 ```ts
 const external = yield* Salesforce.ExternalCredential("PartnerExternal", {
   targetOrg: caller.alias,
