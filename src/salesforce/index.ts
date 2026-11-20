@@ -7,6 +7,11 @@ export {
   type CspTrustedSiteProps,
 } from "./CspTrustedSite.js";
 export {
+  CorsAllowedOrigin,
+  type CorsAllowedOriginAttributes,
+  type CorsAllowedOriginProps,
+} from "./CorsAllowedOrigin.js";
+export {
   AUTHENTICATION_PROTOCOLS,
   ExternalCredential,
   OAUTH_PROTOCOL_VARIANTS,
@@ -41,12 +46,24 @@ export {
   type PermissionSetAssignmentAttributes,
   type PermissionSetAssignmentProps,
 } from "./PermissionSetAssignment.js";
+export {
+  PermissionSetGroupAssignment,
+  type PermissionSetGroupAssignmentAttributes,
+  type PermissionSetGroupAssignmentProps,
+} from "./PermissionSetGroupAssignment.js";
 export { Providers, providers } from "./Providers.js";
 export {
   RemoteSiteSetting,
   type RemoteSiteSettingAttributes,
   type RemoteSiteSettingProps,
 } from "./RemoteSiteSetting.js";
+export {
+  SCRATCH_EDITIONS,
+  ScratchOrg,
+  type ScratchEdition,
+  type ScratchOrgAttributes,
+  type ScratchOrgProps,
+} from "./ScratchOrg.js";
 export {
   SalesforceApiError,
   SalesforceAuthError,

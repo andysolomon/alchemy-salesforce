@@ -43,6 +43,29 @@ interface StoredAssignment {
   Id: string;
   AssigneeId: string;
   PermissionSetId: string;
+  PermissionSetGroupId: string | null;
+}
+
+interface StoredPermissionSetGroup {
+  Id: string;
+  DeveloperName: string;
+  NamespacePrefix: string | null;
+  Status: string;
+}
+
+interface StoredActiveScratchOrg {
+  Id: string;
+  ScratchOrg: string;
+  SignupUsername: string;
+  Status: string;
+  ExpirationDate: string;
+}
+
+interface StoredCorsOrigin {
+  Id: string;
+  DeveloperName: string;
+  MasterLabel: string;
+  UrlPattern: string;
 }
 
 export interface MockOrg {
@@ -66,6 +89,18 @@ export interface MockOrg {
     readonly DisableProtocolSecurity?: boolean;
   }): string;
   setRejectRemoteDelete(reject: boolean): void;
+  seedPermissionSetGroup(
+    developerName: string,
+    options?: { readonly namespace?: string | null; readonly status?: string },
+  ): string;
+  seedGroupAssignment(assigneeId: string, permissionSetGroupId: string): string;
+  seedCorsOrigin(fields: { readonly DeveloperName: string; readonly UrlPattern?: string }): string;
+  /** Change a CORS row behind the provider's back, as an admin in Setup would. */
+  editCorsOrigin(id: string, fields: Partial<Omit<StoredCorsOrigin, "Id">>): void;
+  corsOrigins(): ReadonlyArray<StoredCorsOrigin>;
+  /** Dev Hub record for a scratch org. `orgId` may be 15 or 18 characters. */
+  seedActiveScratchOrg(fields: { readonly orgId: string; readonly username: string; readonly status?: string }): string;
+  activeScratchOrgs(): ReadonlyArray<StoredActiveScratchOrg>;
   removeTrustedSites(): void;
   sites(): ReadonlyArray<StoredSite>;
   assignments(): ReadonlyArray<StoredAssignment>;
@@ -264,6 +299,9 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
   const users = new Map<string, StoredUser>();
   const permissionSets = new Map<string, StoredPermissionSet>();
   const assignments = new Map<string, StoredAssignment>();
+  const permissionSetGroups = new Map<string, StoredPermissionSetGroup>();
+  const corsOrigins = new Map<string, StoredCorsOrigin>();
+  const activeScratchOrgs = new Map<string, StoredActiveScratchOrg>();
   const requests: RecordedRequest[] = [];
   const pages = new Map<string, ReadonlyArray<Record<string, unknown>>>();
   let pageSize = 200;
@@ -279,6 +317,9 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
     users.clear();
     permissionSets.clear();
     assignments.clear();
+    permissionSetGroups.clear();
+    corsOrigins.clear();
+    activeScratchOrgs.clear();
     remoteSites.clear();
     externalCredentials.clear();
     namedCredentials.clear();
@@ -299,10 +340,15 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
     const permissionSet = [...permissionSets.values()].find(
       (candidate) => candidate.Id === assignment.PermissionSetId,
     );
+    const group =
+      assignment.PermissionSetGroupId === null ? undefined : permissionSetGroups.get(assignment.PermissionSetGroupId);
     return {
       Id: assignment.Id,
       AssigneeId: assignment.AssigneeId,
       PermissionSetId: assignment.PermissionSetId,
+      PermissionSetGroupId: assignment.PermissionSetGroupId,
+      PermissionSetGroup:
+        group === undefined ? null : { DeveloperName: group.DeveloperName, NamespacePrefix: group.NamespacePrefix },
       Assignee: user === undefined ? null : { Username: user.Username },
       PermissionSet:
         permissionSet === undefined
@@ -351,6 +397,15 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
       return [...assignments.values()]
         .map(assignmentRecord)
         .filter((record) => matches(record, conditions));
+    }
+    if (name === "PermissionSetGroup") {
+      return [...permissionSetGroups.values()].map((group) => ({ ...group })).filter((record) => matches(record, conditions));
+    }
+    if (name === "ActiveScratchOrg") {
+      return [...activeScratchOrgs.values()].map((row) => ({ ...row })).filter((record) => matches(record, conditions));
+    }
+    if (name === "CorsWhitelistEntry") {
+      return [...corsOrigins.values()].map((origin) => ({ ...origin })).filter((record) => matches(record, conditions));
     }
     if (name === "RemoteProxy") {
       return [...remoteSites.values()].map((site) => ({ ...site })).filter((record) => matches(record, conditions));
@@ -1078,9 +1133,98 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
           }
         }
 
+        if (resource === "ActiveScratchOrg") {
+          const row = id === undefined ? undefined : activeScratchOrgs.get(id);
+          if (id === undefined || row === undefined) {
+            fail(response, 404, "The requested resource does not exist", "NOT_FOUND");
+            return;
+          }
+          if (request.method === "GET") {
+            send(response, 200, { ...row });
+            return;
+          }
+          if (request.method === "DELETE") {
+            activeScratchOrgs.delete(id);
+            send(response, 204);
+            return;
+          }
+        }
+
+        if (resource === "CorsWhitelistEntry") {
+          if (request.method === "POST") {
+            const name = typeof body?.DeveloperName === "string" ? body.DeveloperName : undefined;
+            if (name === undefined || typeof body?.UrlPattern !== "string" || typeof body.MasterLabel !== "string") {
+              fail(response, 400, "Required fields missing", "REQUIRED_FIELD_MISSING");
+              return;
+            }
+            if ([...corsOrigins.values()].some((origin) => origin.DeveloperName === name)) {
+              fail(response, 400, "duplicate developer name", "DUPLICATE_DEVELOPER_NAME");
+              return;
+            }
+            const originId = nextId("0vy");
+            corsOrigins.set(originId, {
+              Id: originId,
+              DeveloperName: name,
+              MasterLabel: body.MasterLabel,
+              UrlPattern: body.UrlPattern,
+            });
+            send(response, 201, { id: originId, success: true, errors: [] });
+            return;
+          }
+          const origin = id === undefined ? undefined : corsOrigins.get(id);
+          if (id === undefined || origin === undefined) {
+            fail(response, 404, "The requested resource does not exist", "NOT_FOUND");
+            return;
+          }
+          if (request.method === "GET") {
+            send(response, 200, { ...origin });
+            return;
+          }
+          if (request.method === "PATCH" && body !== undefined) {
+            corsOrigins.set(id, { ...origin, ...(body as Partial<StoredCorsOrigin>), Id: id });
+            send(response, 204);
+            return;
+          }
+          if (request.method === "DELETE") {
+            corsOrigins.delete(id);
+            send(response, 204);
+            return;
+          }
+        }
+
         if (resource === "PermissionSetAssignment") {
           if (request.method === "POST") {
             const assigneeId = typeof body?.AssigneeId === "string" ? body.AssigneeId : undefined;
+            const groupId = typeof body?.PermissionSetGroupId === "string" ? body.PermissionSetGroupId : undefined;
+            if (groupId !== undefined) {
+              const group = permissionSetGroups.get(groupId);
+              if (assigneeId === undefined || group === undefined) {
+                fail(response, 400, "invalid cross reference id", "INVALID_CROSS_REFERENCE_KEY");
+                return;
+              }
+              if (group.Status === "Updating") {
+                fail(response, 400, "permission set group is being recalculated", "FIELD_INTEGRITY_EXCEPTION");
+                return;
+              }
+              if (
+                [...assignments.values()].some(
+                  (assignment) => assignment.AssigneeId === assigneeId && assignment.PermissionSetGroupId === groupId,
+                )
+              ) {
+                fail(response, 400, "duplicate assignment", "DUPLICATE_VALUE");
+                return;
+              }
+              const groupAssignmentId = nextId("0Pa");
+              // Salesforce points PermissionSetId at the group's aggregate permission set.
+              assignments.set(groupAssignmentId, {
+                Id: groupAssignmentId,
+                AssigneeId: assigneeId,
+                PermissionSetId: `0PSG${groupId.slice(4)}`,
+                PermissionSetGroupId: groupId,
+              });
+              send(response, 201, { id: groupAssignmentId, success: true, errors: [] });
+              return;
+            }
             const permissionSetId = typeof body?.PermissionSetId === "string" ? body.PermissionSetId : undefined;
             if (assigneeId === undefined || permissionSetId === undefined) {
               fail(response, 400, "Required fields missing", "REQUIRED_FIELD_MISSING");
@@ -1095,7 +1239,12 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
               return;
             }
             const assignmentId = nextId("0Pa");
-            assignments.set(assignmentId, { Id: assignmentId, AssigneeId: assigneeId, PermissionSetId: permissionSetId });
+            assignments.set(assignmentId, {
+              Id: assignmentId,
+              AssigneeId: assigneeId,
+              PermissionSetId: permissionSetId,
+              PermissionSetGroupId: null,
+            });
             send(response, 201, { id: assignmentId, success: true, errors: [] });
             return;
           }
@@ -1225,9 +1374,64 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
     },
     seedAssignment: (assigneeId, permissionSetId) => {
       const assignmentId = nextId("0Pa");
-      assignments.set(assignmentId, { Id: assignmentId, AssigneeId: assigneeId, PermissionSetId: permissionSetId });
+      assignments.set(assignmentId, {
+        Id: assignmentId,
+        AssigneeId: assigneeId,
+        PermissionSetId: permissionSetId,
+        PermissionSetGroupId: null,
+      });
       return assignmentId;
     },
+    seedPermissionSetGroup: (developerName, options) => {
+      const groupId = nextId("0PG");
+      permissionSetGroups.set(groupId, {
+        Id: groupId,
+        DeveloperName: developerName,
+        NamespacePrefix: options?.namespace ?? null,
+        Status: options?.status ?? "Updated",
+      });
+      return groupId;
+    },
+    seedGroupAssignment: (assigneeId, permissionSetGroupId) => {
+      const assignmentId = nextId("0Pa");
+      assignments.set(assignmentId, {
+        Id: assignmentId,
+        AssigneeId: assigneeId,
+        PermissionSetId: `0PSG${permissionSetGroupId.slice(4)}`,
+        PermissionSetGroupId: permissionSetGroupId,
+      });
+      return assignmentId;
+    },
+    seedCorsOrigin: (fields) => {
+      const originId = nextId("0vy");
+      corsOrigins.set(originId, {
+        Id: originId,
+        DeveloperName: fields.DeveloperName,
+        MasterLabel: fields.DeveloperName,
+        UrlPattern: fields.UrlPattern ?? "https://seed.example",
+      });
+      return originId;
+    },
+    editCorsOrigin: (id, fields) => {
+      const origin = corsOrigins.get(id);
+      if (origin === undefined) {
+        throw new Error(`No CORS origin ${id}`);
+      }
+      corsOrigins.set(id, { ...origin, ...fields, Id: id });
+    },
+    corsOrigins: () => [...corsOrigins.values()],
+    seedActiveScratchOrg: (fields) => {
+      const rowId = nextId("2SR");
+      activeScratchOrgs.set(rowId, {
+        Id: rowId,
+        ScratchOrg: fields.orgId.slice(0, 15),
+        SignupUsername: fields.username,
+        Status: fields.status ?? "Active",
+        ExpirationDate: "2026-12-01",
+      });
+      return rowId;
+    },
+    activeScratchOrgs: () => [...activeScratchOrgs.values()],
     seedRemoteSite: (fields) => {
       const remoteId = nextId("0rp");
       remoteSites.set(remoteId, {

@@ -2,6 +2,7 @@ import * as Provider from "alchemy/Provider";
 import * as Layer from "effect/Layer";
 import { CspTrustedSite, CspTrustedSiteProvider } from "./CspTrustedSite.js";
 import { OrgDirectoryLive } from "./connection.js";
+import { CorsAllowedOrigin, CorsAllowedOriginProvider } from "./CorsAllowedOrigin.js";
 import { ExternalCredential, ExternalCredentialProvider } from "./ExternalCredential.js";
 import {
   ExternalCredentialPrincipalAccess,
@@ -14,7 +15,12 @@ import {
 import { NamedCredential, NamedCredentialProvider } from "./NamedCredential.js";
 import { Org, OrgProvider } from "./Org.js";
 import { PermissionSetAssignment, PermissionSetAssignmentProvider } from "./PermissionSetAssignment.js";
+import {
+  PermissionSetGroupAssignment,
+  PermissionSetGroupAssignmentProvider,
+} from "./PermissionSetGroupAssignment.js";
 import { RemoteSiteSetting, RemoteSiteSettingProvider } from "./RemoteSiteSetting.js";
+import { ScratchOrg, ScratchOrgProvider } from "./ScratchOrg.js";
 
 /**
  * Same shape as Alchemy's built-in bundles (`Cloudflare.providers()`).
@@ -28,8 +34,11 @@ export const providers = () =>
     Providers,
     Provider.collection([
       Org,
+      ScratchOrg,
       CspTrustedSite,
+      CorsAllowedOrigin,
       PermissionSetAssignment,
+      PermissionSetGroupAssignment,
       RemoteSiteSetting,
       ExternalCredential,
       NamedCredential,
@@ -40,8 +49,11 @@ export const providers = () =>
     Layer.provideMerge(
       Layer.mergeAll(
         OrgProvider,
+        ScratchOrgProvider,
         CspTrustedSiteProvider,
+        CorsAllowedOriginProvider,
         PermissionSetAssignmentProvider,
+        PermissionSetGroupAssignmentProvider,
         RemoteSiteSettingProvider,
         ExternalCredentialProvider,
         NamedCredentialProvider,
