@@ -24,7 +24,11 @@ import {
 } from "./credentialSecrets.js";
 import { isNotFound, redactApiError, SalesforceApiError, SalesforceValidationError } from "./errors.js";
 import { requireDeveloperName } from "./names.js";
-import { PRINCIPAL_TYPES, type PrincipalType } from "./ExternalCredential.js";
+import {
+  PRINCIPAL_TYPES,
+  publishExternalCredentialAuthenticationStatus,
+  type PrincipalType,
+} from "./ExternalCredential.js";
 
 /**
  * Connect REST `/named-credentials/credential`.
@@ -351,8 +355,17 @@ export const ExternalCredentialSecretProvider = Provider.succeed(
           Effect.gen(function* () {
             const connection = yield* connectionFor(identity.targetOrg);
             const live = yield* readLive(connection, identity);
+            const finish = (authenticationStatus: string) =>
+              Effect.gen(function* () {
+                const attributes = attributesFrom(identity, authenticationStatus);
+                yield* publishExternalCredentialAuthenticationStatus(
+                  identity.externalCredential,
+                  identity.targetOrg,
+                );
+                return attributes;
+              });
             if (live !== undefined && valuesMatch(live, secrets)) {
-              return attributesFrom(identity, live.authenticationStatus);
+              return yield* finish(live.authenticationStatus);
             }
             const body = requestBody(identity, secrets);
             const path = credentialPath(connection.apiVersion);
@@ -369,7 +382,7 @@ export const ExternalCredentialSecretProvider = Provider.succeed(
                   record === undefined
                     ? "Configured"
                     : (stringField(record, "authenticationStatus") ?? "Configured");
-                return attributesFrom(identity, status);
+                return yield* finish(status);
               }
             }
             yield* request(connection, { method: "PUT", path, body }).pipe(
@@ -395,7 +408,7 @@ export const ExternalCredentialSecretProvider = Provider.succeed(
                 }),
               );
             }
-            return attributesFrom(identity, after?.authenticationStatus ?? "Configured");
+            return yield* finish(after?.authenticationStatus ?? "Configured");
           }),
           values,
         );

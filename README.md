@@ -24,10 +24,21 @@ This package is not published. From an app that already depends on Alchemy:
 
 ```sh
 npm install alchemy@2.0.0-beta.87 effect@4.1.4 @effect/platform-node@4.1.4
-npm install github:andysolomon/alchemy-salesforce
+npm install git+https://github.com/andysolomon/alchemy-salesforce.git#<commit-sha>
 ```
 
 `alchemy`, `effect`, and `@effect/platform-node` are peer dependencies. Keep them on these versions so resource identity and the Effect runtime match.
+
+Pin a commit SHA. This package is private and unpublished. npm installs git dependencies by packing a tarball, and that pack runs `prepare`, not `prepack`. `prepare` compiles `src/` to `dist/` (the `files` list ships `dist/`, which is gitignored). Without `prepare`, the installed package has no `dist/index.js`.
+
+npm fetches GitHub git dependencies over SSH (`git+ssh://git@github.com/...`), even when `package.json` says `git+https://`. An SSH key that can read this repository is enough for `npm ci`. If you authenticate with `gh` over HTTPS, point SSH at HTTPS before installing, then let `gh` supply the credential:
+
+```sh
+git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+gh auth setup-git
+```
+
+In CI, `actions/checkout` only authenticates the workflow checkout. Set the same `insteadOf` globally and pass a token that can read this repository (`GITHUB_TOKEN` from another repo cannot).
 
 To work on the provider itself:
 
@@ -225,6 +236,8 @@ Connect REST `/services/data/vXX.0/named-credentials/external-credentials`. Upda
 OAuth client credentials need `{ parameterName: "AuthProviderUrl", parameterType: "AuthProviderUrl", parameterValue: "https://<my-domain>/services/oauth2/token" }`. That host is the **target** org's My Domain. `login.salesforce.com` and `test.salesforce.com` are rejected before a request is sent. A `NamedPrincipal` is required so a secret and a permission set can be attached.
 
 Changing `targetOrg` or the developer name replaces the row (delete first). A second plan with the same props is a noop. Delete treats HTTP 404 as already gone.
+
+`authenticationStatus` (and each principal's status) is observed, not configured. The credential is created before `ExternalCredentialSecret` binds values, so the first write often records `NotConfigured`. Binding the secret copies the live status back onto that snapshot. Later plans GET the credential and, when Salesforce now reports `Configured`, write that into state. The plan action stays **noop**. A status change does not PUT the credential. `ExternalCredentialSecret.authenticationStatus` is the status from the credential bind itself.
 
 ```ts
 const external = yield* Salesforce.ExternalCredential("PartnerExternal", {
