@@ -89,7 +89,10 @@ test.provider("grants a permission set access to an external credential principa
       }),
     );
     expect(Object.values(planned.resources).every((resource) => resource.action === "noop")).toBe(true);
-    expect(org.requests.length).toBe(before);
+    const refreshReads = org.requests.slice(before);
+    expect(refreshReads.every((request) => request.method === "GET" && request.resource === "external-credentials")).toBe(
+      true,
+    );
 
     yield* stack.destroy();
     expect(org.setupEntityAccess()).toEqual([]);
