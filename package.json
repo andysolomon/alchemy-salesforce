@@ -1,0 +1,56 @@
+{
+  "name": "alchemy-salesforce",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Alchemy provider for Salesforce org configuration: CSP trusted sites, remote sites, permission set assignments, external credentials, named credentials, and principal access.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andysolomon/alchemy-salesforce.git"
+  },
+  "engines": {
+    "node": ">=24.11.1"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@effect/platform-node": "4.1.4",
+    "alchemy": "2.0.0-beta.87",
+    "effect": "4.1.4"
+  },
+  "devDependencies": {
+    "@alchemy.run/test": "2.0.0-beta.87",
+    "@effect/platform-node": "4.1.4",
+    "@effect/vitest": "4.1.4",
+    "@types/node": "24.10.1",
+    "alchemy": "2.0.0-beta.87",
+    "effect": "4.1.4",
+    "typescript": "5.9.3",
+    "vitest": "5.0.4"
+  },
+  "keywords": [
+    "alchemy",
+    "salesforce",
+    "infrastructure-as-code",
+    "effect"
+  ]
+}
