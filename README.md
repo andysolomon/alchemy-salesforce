@@ -304,3 +304,7 @@ When the alias and the stage name differ, set `SF_TARGET_ORG` and still pass a s
 - Remote-site DELETE is not in the published Tooling API. Destroy may deactivate instead of delete. The mock covers that fallback.
 - Credential values exist only in process memory for the apply. A crash before the write leaves Salesforce unchanged and leaves nothing secret on disk. A crash after the write still has only the digest in state.
 - This package does not deploy Apex, permission set definitions, or legacy named credentials.
+
+## License
+
+[MIT](LICENSE)
