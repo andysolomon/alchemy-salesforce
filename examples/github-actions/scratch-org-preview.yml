@@ -1,0 +1,60 @@
+# A scratch org per pull request, built from examples/scratch-org.ts.
+# Opened or pushed: create or update `pr-<number>`. Closed: delete it.
+# Copy to .github/workflows/. Pull requests from forks get no secrets, so
+# this only runs for branches in this repository.
+name: Scratch org preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scratch-org-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: devhub
+    env:
+      STAGE: pr-${{ github.event.pull_request.number }}
+      SF_DEV_HUB: devhub
+      # Lets ScratchOrg log back in to this PR's org on a later run's fresh runner.
+      SF_JWT_CLIENT_ID: ${{ vars.SF_CLIENT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm install --global @salesforce/cli
+      - name: Authorize the Dev Hub (JWT)
+        env:
+          SF_JWT_KEY: ${{ secrets.SF_JWT_KEY }}
+          SF_DEVHUB_USERNAME: ${{ vars.SF_DEVHUB_USERNAME }}
+        run: |
+          printf '%s' "$SF_JWT_KEY" > "$RUNNER_TEMP/server.key"
+          echo "SF_JWT_KEY_FILE=$RUNNER_TEMP/server.key" >> "$GITHUB_ENV"
+          sf org login jwt --username "$SF_DEVHUB_USERNAME" --client-id "$SF_JWT_CLIENT_ID" \
+            --jwt-key-file "$RUNNER_TEMP/server.key" --alias "$SF_DEV_HUB" --set-default-dev-hub
+      - name: Create or update the preview org
+        if: github.event.action != 'closed'
+        run: |
+          npx alchemy deploy --config alchemy.preview.ts --stage "$STAGE" --yes --no-input | tee deploy.txt
+          {
+            echo "### Scratch org \`$STAGE\`"
+            echo '```'
+            tail -n 20 deploy.txt
+            echo '```'
+            echo "Open it locally: \`sf org login jwt ...\` then \`sf org open --target-org $STAGE\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Delete the preview org
+        if: github.event.action == 'closed'
+        run: npx alchemy destroy --config alchemy.preview.ts --stage "$STAGE" --yes --no-input

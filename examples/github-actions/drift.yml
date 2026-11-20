@@ -1,0 +1,71 @@
+# Nightly drift check. Someone changing a trusted site, CORS origin, or
+# credential by hand in Setup opens (or updates) an issue and fails the run.
+# Nothing is repaired automatically. Copy to .github/workflows/.
+name: Salesforce drift
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    name: drift (${{ matrix.stage }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [uat, prod]
+    environment: ${{ matrix.stage }}
+    env:
+      STAGE: ${{ matrix.stage }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm install --global @salesforce/cli
+      - name: Authorize the org (JWT)
+        env:
+          SF_JWT_KEY: ${{ secrets.SF_JWT_KEY }}
+          SF_CLIENT_ID: ${{ vars.SF_CLIENT_ID }}
+          SF_USERNAME: ${{ vars.SF_USERNAME }}
+          SF_LOGIN_URL: ${{ vars.SF_LOGIN_URL }}
+        run: |
+          printf '%s' "$SF_JWT_KEY" > "$RUNNER_TEMP/server.key"
+          sf org login jwt --username "$SF_USERNAME" --client-id "$SF_CLIENT_ID" \
+            --jwt-key-file "$RUNNER_TEMP/server.key" --instance-url "${SF_LOGIN_URL:-https://login.salesforce.com}" \
+            --alias "$STAGE"
+      - name: Detect drift
+        id: drift
+        # Without --yes, `alchemy drift` only reports. Exit 2 means drift was found.
+        run: |
+          set +e
+          npx alchemy drift --stage "$STAGE" --no-input > drift.txt 2>&1
+          code=$?
+          set -e
+          cat drift.txt
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then exit "$code"; fi
+      - name: Open or update an issue
+        if: steps.drift.outputs.code == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Salesforce drift in $STAGE"
+          body="$(printf 'The nightly check found changes made outside the stack.\n\nRepair: `npx alchemy drift --stage %s --repair --yes`\nOr change the stack to match, and deploy.\n\n```\n%s\n```\n' "$STAGE" "$(tail -n 80 drift.txt)")"
+          number="$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+          exit 1

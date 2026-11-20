@@ -1,0 +1,12 @@
+{
+  "name": "alchemy-salesforce-example-cloudflare",
+  "private": true,
+  "type": "module",
+  "description": "A Cloudflare Worker and the Salesforce configuration that calls it, in one Alchemy stack.",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@alchemy.run/cloudflare": "2.0.0-beta.87"
+  }
+}

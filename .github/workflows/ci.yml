@@ -18,3 +18,22 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  example-cloudflare:
+    # Typechecks examples/salesforce-cloudflare against this repo's source.
+    # Its dependencies stay out of the root package so installs from GitHub stay small.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            examples/salesforce-cloudflare/package-lock.json
+      - run: npm ci
+      - run: npm ci
+        working-directory: examples/salesforce-cloudflare
+      - run: npm run typecheck
+        working-directory: examples/salesforce-cloudflare
