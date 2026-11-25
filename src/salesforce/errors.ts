@@ -53,8 +53,13 @@ export const errorMessage = (cause: unknown): string => {
  * Longer secrets are applied first so a shorter one cannot split a longer one.
  * Secrets shorter than 4 characters are left alone so they cannot eat ordinary words.
  */
+const pemBlocks = (text: string): ReadonlyArray<string> =>
+  [...text.matchAll(/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----/g)].flatMap((match) =>
+    match[0] === undefined ? [] : [match[0]],
+  );
+
 export const redactSensitiveText = (text: string, secrets: ReadonlyArray<string>): string => {
-  const forms = [...new Set(secrets.filter((secret) => secret.length >= 4))].sort(
+  const forms = [...new Set([...secrets, ...pemBlocks(text)].filter((secret) => secret.length >= 4))].sort(
     (left, right) => right.length - left.length,
   );
   let redacted = text;

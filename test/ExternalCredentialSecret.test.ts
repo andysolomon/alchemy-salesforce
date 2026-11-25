@@ -5,6 +5,7 @@ import * as Exit from "effect/Exit";
 import * as Redacted from "effect/Redacted";
 import * as Salesforce from "../src/salesforce/index.js";
 import { clearCredentialSecrets } from "../src/salesforce/credentialSecrets.js";
+import { sha256Hex } from "../src/salesforce/hash.js";
 import { bindMockOrg } from "./harness.js";
 import type { MockOrg } from "./mock-org.js";
 
@@ -181,6 +182,54 @@ test.provider("posts when an update is rejected because the principal has no cre
     expect(text).not.toContain(CLIENT_SECRET);
     expect(text).not.toContain("stale-client-secret");
     expect(created.authenticationStatus).toBe("Configured");
+    yield* stack.destroy();
+  }),
+);
+
+test.provider("refuses to send when clientId does not match the external client app", (stack) =>
+  Effect.gen(function* () {
+    const exit = yield* Effect.exit(
+      stack.deploy(
+        Effect.gen(function* () {
+          return yield* Salesforce.ExternalCredentialSecret("BankingSecret", {
+            ...secretProps(),
+            clientApp: {
+              consumerKeySha256: "a".repeat(64),
+              consumerId: "888000000000001",
+            },
+          });
+        }),
+      ),
+    );
+    expect(Exit.isFailure(exit)).toBe(true);
+    if (Exit.isFailure(exit)) {
+      const text = String(exit.cause);
+      expect(text).toContain("out of date");
+      expect(text).not.toContain(CLIENT_ID);
+      expect(text).not.toContain(CLIENT_SECRET);
+    }
+    expect(writes()).toHaveLength(0);
+    expect(org.requests.filter((request) => request.resource === "credential")).toHaveLength(0);
+  }),
+);
+
+test.provider("sends credentials when clientId matches the external client app hash", (stack) =>
+  Effect.gen(function* () {
+    const created = yield* stack.deploy(
+      Effect.gen(function* () {
+        return yield* Salesforce.ExternalCredentialSecret("BankingSecret", {
+          ...secretProps(),
+          clientApp: {
+            consumerKeySha256: sha256Hex(CLIENT_ID),
+            consumerId: "888000000000001",
+          },
+        });
+      }),
+    );
+    expect(created.authenticationStatus).toBe("Configured");
+    expect(writes()).toHaveLength(1);
+    expect(JSON.stringify(created)).not.toContain(CLIENT_ID);
+    expect(JSON.stringify(created)).not.toContain(CLIENT_SECRET);
     yield* stack.destroy();
   }),
 );

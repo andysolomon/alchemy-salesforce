@@ -2,6 +2,7 @@ import * as Provider from "alchemy/Provider";
 import * as Layer from "effect/Layer";
 import { CspTrustedSite, CspTrustedSiteProvider } from "./CspTrustedSite.js";
 import { OrgDirectoryLive } from "./connection.js";
+import { ExternalClientAppProvider, ExternalClientAppResource } from "./ExternalClientApp.js";
 import { ExternalCredential, ExternalCredentialProvider } from "./ExternalCredential.js";
 import {
   ExternalCredentialPrincipalAccess,
@@ -31,6 +32,7 @@ export const providers = () =>
       CspTrustedSite,
       PermissionSetAssignment,
       RemoteSiteSetting,
+      ExternalClientAppResource,
       ExternalCredential,
       NamedCredential,
       ExternalCredentialSecretResource,
@@ -43,6 +45,7 @@ export const providers = () =>
         CspTrustedSiteProvider,
         PermissionSetAssignmentProvider,
         RemoteSiteSettingProvider,
+        ExternalClientAppProvider,
         ExternalCredentialProvider,
         NamedCredentialProvider,
         ExternalCredentialSecretProvider,
