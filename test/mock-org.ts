@@ -1,5 +1,8 @@
+import { Buffer } from "node:buffer";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { metadataFieldsEqual, readMetadataZip, type MetadataField, type MetadataFields } from "../src/salesforce/metadata.js";
+import { escapeXml } from "../src/salesforce/xml.js";
 
 export interface RecordedRequest {
   readonly method: string;
@@ -105,6 +108,34 @@ export interface MockOrg {
   removeNamedCredential(developerName: string): void;
   removeCredentials(): void;
   removeSetupEntityAccess(): void;
+  seedProfile(name: string, id?: string): string;
+  seedExternalClientApp(fields: {
+    readonly developerName: string;
+    readonly label?: string;
+    readonly contactEmail?: string;
+    readonly description?: string | null;
+    readonly scopes?: string;
+    readonly callbackUrl?: string;
+    readonly certificate?: string | null;
+    readonly pkceRequired?: boolean;
+    readonly clientCredentials?: boolean;
+    readonly runAsUsername?: string;
+    readonly permittedUsers?: "AllSelfAuthorized" | "AdminApprovedPreAuthorized";
+    readonly permissionSets?: string;
+    readonly ipRelaxation?: string;
+    readonly enabled?: boolean;
+    readonly policyFullName?: string;
+  }): { readonly id: string; readonly consumerId: string; readonly consumerKey: string };
+  externalClientApp(developerName: string):
+    | {
+        readonly id: string;
+        readonly consumerId: string;
+        readonly consumerKey: string;
+        readonly policyFullName: string | undefined;
+        readonly parts: ReadonlyArray<{ readonly type: string; readonly fullName: string; readonly fields: MetadataFields }>;
+      }
+    | undefined;
+  setRotateConsumerKeyOnDeploy(rotate: boolean): void;
 }
 
 export interface MockOrgOptions {
@@ -182,13 +213,15 @@ interface StoredSetupAccess {
 
 const DEFAULT_TOKEN = "test-token";
 
-const readBody = (request: IncomingMessage): Promise<string> =>
+const readBuffer = (request: IncomingMessage): Promise<Buffer> =>
   new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
-    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    request.on("end", () => resolve(Buffer.concat(chunks)));
     request.on("error", reject);
   });
+
+const readBody = (request: IncomingMessage): Promise<string> => readBuffer(request).then((body) => body.toString("utf8"));
 
 const send = (response: ServerResponse, status: number, body?: unknown): void => {
   if (body === undefined) {
@@ -258,6 +291,12 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
   const namedCredentials = new Map<string, StoredNamedCredential>();
   const credentialSecrets = new Map<string, StoredCredential>();
   const setupAccess = new Map<string, StoredSetupAccess>();
+  const profiles = new Map<string, { Id: string; Name: string }>();
+  const metadataComponents = new Map<string, { type: string; fullName: string; fields: Record<string, MetadataField> }>();
+  const clientApps = new Map<string, { id: string; developerName: string; consumerId: string; consumerKey: string }>();
+  const deployResults = new Map<string, Record<string, unknown>>();
+  let rotateConsumerKeyOnDeploy = false;
+  const orgId = options.orgId ?? "00DMOCK000000001";
   let rejectRemoteDelete = false;
   let echoCredentialFailure = false;
   let rejectUnstoredCredentialPut = false;
@@ -284,6 +323,11 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
     namedCredentials.clear();
     credentialSecrets.clear();
     setupAccess.clear();
+    profiles.clear();
+    metadataComponents.clear();
+    clientApps.clear();
+    deployResults.clear();
+    rotateConsumerKeyOnDeploy = false;
     requests.length = 0;
     pages.clear();
     pageSize = 200;
@@ -358,6 +402,23 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
     if (name === "SetupEntityAccess") {
       return [...setupAccess.values()].map((row) => ({ ...row })).filter((record) => matches(record, conditions));
     }
+    if (name === "Profile") {
+      return [...profiles.values()].map((profile) => ({ ...profile })).filter((record) => matches(record, conditions));
+    }
+    if (name === "ExternalClientApplication") {
+      return [...clientApps.values()]
+        .map((app) => {
+          const component = metadataComponents.get(`ExternalClientApplication\0${app.developerName}`);
+          return {
+            Id: app.id,
+            DeveloperName: app.developerName,
+            MasterLabel: component?.fields.label ?? app.developerName,
+            ContactEmail: component?.fields.contactEmail ?? null,
+            Description: component?.fields.description ?? null,
+          };
+        })
+        .filter((record) => matches(record, conditions));
+    }
     throw new Error(`Mock SOQL does not know ${name}`);
   };
 
@@ -388,10 +449,209 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
       "IsApplicableToStyleSrc",
     ].some((field) => body[field] === true);
 
+  const componentKey = (type: string, fullName: string): string => `${type}\0${fullName}`;
+
+  const putComponent = (type: string, fullName: string, fields: Record<string, MetadataField>): void => {
+    metadataComponents.set(componentKey(type, fullName), {
+      type,
+      fullName,
+      fields: structuredClone(fields),
+    });
+  };
+
+  const developerNameOf = (file: { type: string; fullName: string; fields: MetadataFields }): string | undefined => {
+    if (file.type === "ExternalClientApplication") {
+      return file.fullName;
+    }
+    const linked = file.fields.externalClientApplication;
+    return typeof linked === "string" ? linked : undefined;
+  };
+
+  const xmlFields = (fullName: string, fields: MetadataFields): string => {
+    const parts = [`<fullName>${escapeXml(fullName)}</fullName>`];
+    for (const [key, value] of Object.entries(fields)) {
+      if (typeof value === "string") {
+        parts.push(`<${key}>${escapeXml(value)}</${key}>`);
+      } else if (typeof value === "boolean") {
+        parts.push(`<${key}>${value ? "true" : "false"}</${key}>`);
+      }
+    }
+    return parts.join("");
+  };
+
+  const applyMetadataDeploy = (
+    files: ReadonlyArray<{ type: string; fullName: string; fields: MetadataFields }>,
+    destructive: ReadonlyArray<{ type: string; fullName: string }>,
+    checkOnly: boolean,
+  ) => {
+    const components: Array<Record<string, unknown>> = [];
+    for (const file of files) {
+      const stored = metadataComponents.get(componentKey(file.type, file.fullName));
+      const changed = stored === undefined || !metadataFieldsEqual(stored.fields, file.fields);
+      components.push({
+        componentType: file.type,
+        fullName: file.fullName,
+        changed,
+        created: stored === undefined,
+        deleted: false,
+        success: true,
+        problem: null,
+        problemType: null,
+        fileName: file.fullName,
+      });
+      if (checkOnly) {
+        continue;
+      }
+      const fields: Record<string, MetadataField> = { ...file.fields };
+      delete fields.consumerSecret;
+      if (file.type === "ExternalClientApplication" && typeof fields.orgScopedExternalApp !== "string") {
+        fields.orgScopedExternalApp = `${orgId}:${file.fullName}`;
+      }
+      if (file.type === "ExternalClientApplication" && !clientApps.has(file.fullName)) {
+        clientApps.set(file.fullName, {
+          id: nextId("0xI"),
+          developerName: file.fullName,
+          consumerId: nextId("888"),
+          consumerKey: "",
+        });
+      }
+      if (file.type === "ExtlClntAppGlobalOauthSettings") {
+        const name =
+          typeof fields.externalClientApplication === "string"
+            ? fields.externalClientApplication
+            : file.fullName.replace(/_GlblOauth$/, "");
+        let app = clientApps.get(name);
+        if (app === undefined) {
+          app = { id: nextId("0xI"), developerName: name, consumerId: nextId("888"), consumerKey: "" };
+          clientApps.set(name, app);
+        }
+        const sentKey = typeof fields.consumerKey === "string" ? fields.consumerKey : undefined;
+        const rotate =
+          fields.shouldRotateConsumerKey === true ||
+          (app.consumerKey.length > 0 && sentKey === undefined);
+        if (sentKey === undefined || rotate) {
+          app.consumerKey = `3MVG9mock${app.consumerId}${nextId("k")}`;
+        } else {
+          app.consumerKey = sentKey;
+        }
+        fields.consumerKey = app.consumerKey;
+        fields.shouldRotateConsumerKey = false;
+        fields.shouldRotateConsumerSecret = false;
+      }
+      if (file.type === "ExtlClntAppOauthSettings") {
+        const name =
+          typeof fields.externalClientApplication === "string"
+            ? fields.externalClientApplication
+            : file.fullName.replace(/_Oauth$/, "");
+        const app = clientApps.get(name);
+        if (app !== undefined && typeof fields.oauthLink !== "string") {
+          fields.oauthLink = `${orgId}:${app.consumerId}`;
+        }
+      }
+      putComponent(file.type, file.fullName, fields);
+    }
+    for (const member of destructive) {
+      const stored = metadataComponents.get(componentKey(member.type, member.fullName));
+      components.push({
+        componentType: member.type,
+        fullName: member.fullName,
+        changed: stored !== undefined,
+        created: false,
+        deleted: stored !== undefined,
+        success: true,
+        problem: null,
+        problemType: null,
+        fileName: member.fullName,
+      });
+      if (!checkOnly && stored !== undefined) {
+        metadataComponents.delete(componentKey(member.type, member.fullName));
+        if (member.type === "ExternalClientApplication") {
+          clientApps.delete(member.fullName);
+        }
+      }
+    }
+    if (!checkOnly && rotateConsumerKeyOnDeploy) {
+      const names = new Set<string>();
+      for (const file of files) {
+        const name = developerNameOf(file);
+        if (name !== undefined) {
+          names.add(name);
+        }
+      }
+      for (const name of names) {
+        const app = clientApps.get(name);
+        const globalComponent = metadataComponents.get(componentKey("ExtlClntAppGlobalOauthSettings", `${name}_GlblOauth`));
+        if (app === undefined || globalComponent === undefined) {
+          continue;
+        }
+        app.consumerKey = `${app.consumerKey}rotated`;
+        globalComponent.fields = { ...globalComponent.fields, consumerKey: app.consumerKey };
+      }
+    }
+    return components;
+  };
+
   const server = createServer((request, response) => {
     void (async () => {
       try {
         const url = new URL(request.url ?? "/", "http://127.0.0.1");
+        if (url.pathname.startsWith("/services/Soap/m/")) {
+          const raw = await readBody(request);
+          const session = raw.match(/<(?:[\w.-]+:)?sessionId>([^<]*)<\/(?:[\w.-]+:)?sessionId>/);
+          if (session?.[1] !== token) {
+            response.writeHead(500, { "content-type": "text/xml; charset=UTF-8" });
+            response.end(
+              `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body><soapenv:Fault><faultcode>INVALID_SESSION_ID</faultcode><faultstring>Session expired or invalid</faultstring></soapenv:Fault></soapenv:Body></soapenv:Envelope>`,
+            );
+            return;
+          }
+          const xmlValue = (tag: string): string[] =>
+            [...raw.matchAll(new RegExp(`<(?:[\\w.-]+:)?${tag}>([^<]*)</(?:[\\w.-]+:)?${tag}>`, "g"))].flatMap(
+              (match) => (match[1] === undefined ? [] : [match[1]]),
+            );
+          if (raw.includes("readMetadata")) {
+            const type = xmlValue("type")[0] ?? "";
+            const fullNames = xmlValue("fullNames");
+            requests.push({ method: "POST", resource: "readMetadata", body: { type, fullNames }, path: url.pathname });
+            const records = fullNames
+              .map((fullName) => {
+                const stored = metadataComponents.get(componentKey(type, fullName));
+                if (stored === undefined) {
+                  return `<records xsi:nil="true"/>`;
+                }
+                const fields = { ...stored.fields };
+                delete fields.consumerSecret;
+                return `<records>${xmlFields(stored.fullName, fields)}</records>`;
+              })
+              .join("");
+            response.writeHead(200, { "content-type": "text/xml; charset=UTF-8" });
+            response.end(
+              `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><soapenv:Body><readMetadataResponse><result>${records}</result></readMetadataResponse></soapenv:Body></soapenv:Envelope>`,
+            );
+            return;
+          }
+          if (raw.includes("listMetadata")) {
+            const type = xmlValue("type")[0] ?? "";
+            requests.push({ method: "POST", resource: "listMetadata", body: { type }, path: url.pathname });
+            const results = [...metadataComponents.values()]
+              .filter((component) => component.type === type)
+              .map(
+                (component) =>
+                  `<result><fullName>${escapeXml(component.fullName)}</fullName><type>${escapeXml(component.type)}</type><fileName>${escapeXml(component.fullName)}</fileName></result>`,
+              )
+              .join("");
+            response.writeHead(200, { "content-type": "text/xml; charset=UTF-8" });
+            response.end(
+              `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body><listMetadataResponse>${results}</listMetadataResponse></soapenv:Body></soapenv:Envelope>`,
+            );
+            return;
+          }
+          response.writeHead(500, { "content-type": "text/xml; charset=UTF-8" });
+          response.end(
+            `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body><soapenv:Fault><faultcode>UNKNOWN</faultcode><faultstring>Unsupported metadata operation</faultstring></soapenv:Fault></soapenv:Body></soapenv:Envelope>`,
+          );
+          return;
+        }
         if (request.headers.authorization !== `Bearer ${token}`) {
           fail(response, 401, "Session expired or invalid", "INVALID_SESSION_ID");
           return;
@@ -402,6 +662,101 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
             preferred_username: options.username ?? "user@example.com",
           });
           return;
+        }
+        const deployRoute = url.pathname.match(/^\/services\/data\/v[\d.]+\/metadata\/deployRequest(?:\/([^/]+))?$/);
+        if (deployRoute !== null) {
+          const deployId = deployRoute[1];
+          if (request.method === "GET" && deployId !== undefined) {
+            const stored = deployResults.get(deployId);
+            if (stored === undefined) {
+              fail(response, 404, "Deploy request was not found", "NOT_FOUND");
+              return;
+            }
+            requests.push({ method: "GET", resource: "deployRequest", id: deployId, path: `${url.pathname}${url.search}` });
+            send(response, 200, stored);
+            return;
+          }
+          if (request.method === "POST" && deployId === undefined) {
+            const raw = await readBuffer(request);
+            const contentType = request.headers["content-type"] ?? "";
+            const boundaryMatch = /boundary=(?:"([^"]+)"|([^;]+))/.exec(contentType);
+            const boundary = (boundaryMatch?.[1] ?? boundaryMatch?.[2])?.trim();
+            if (boundary === undefined) {
+              fail(response, 400, "Metadata deploy requires multipart/form-data", "INVALID_INPUT");
+              return;
+            }
+            const marker = Buffer.from(`--${boundary}`);
+            const parts: Buffer[] = [];
+            let offset = raw.indexOf(marker);
+            while (offset >= 0) {
+              const next = raw.indexOf(marker, offset + marker.length);
+              if (next < 0) {
+                break;
+              }
+              parts.push(raw.subarray(offset + marker.length, next));
+              offset = next;
+            }
+            let checkOnly = false;
+            let archive: Buffer | undefined;
+            for (const part of parts) {
+              const separator = part.indexOf(Buffer.from("\r\n\r\n"));
+              if (separator < 0) {
+                continue;
+              }
+              const headers = part.subarray(0, separator).toString("utf8");
+              let body = part.subarray(separator + 4);
+              if (body.length >= 2 && body[body.length - 2] === 13 && body[body.length - 1] === 10) {
+                body = body.subarray(0, body.length - 2);
+              }
+              if (headers.includes(`name="json"`)) {
+                const parsed = JSON.parse(body.toString("utf8")) as { deployOptions?: { checkOnly?: boolean } };
+                checkOnly = parsed.deployOptions?.checkOnly === true;
+              } else if (headers.includes(`name="file"`)) {
+                archive = body;
+              }
+            }
+            if (archive === undefined) {
+              fail(response, 400, "Metadata deploy is missing the zip", "INVALID_INPUT");
+              return;
+            }
+            let unpacked: ReturnType<typeof readMetadataZip>;
+            try {
+              unpacked = readMetadataZip(archive);
+            } catch {
+              fail(response, 400, "Metadata zip could not be read", "INVALID_INPUT");
+              return;
+            }
+            const components = applyMetadataDeploy(unpacked.files, unpacked.destructive, checkOnly);
+            const id = nextId("0Af");
+            const result = {
+              id,
+              deployResult: {
+                id,
+                done: true,
+                success: true,
+                status: "Succeeded",
+                checkOnly,
+                details: { componentSuccesses: components, componentFailures: [] },
+              },
+            };
+            deployResults.set(id, result);
+            requests.push({
+              method: "POST",
+              resource: "deployRequest",
+              id,
+              path: url.pathname,
+              body: {
+                checkOnly,
+                files: unpacked.files,
+                destructive: unpacked.destructive,
+              },
+            });
+            send(response, 201, {
+              id,
+              deployResult: { id, done: false, success: false, status: "Pending", checkOnly },
+            });
+            return;
+          }
         }
         const locator = url.pathname.match(/\/query\/([^/]+)$/);
         if (request.method === "GET" && locator !== null && locator[1] !== undefined) {
@@ -1354,6 +1709,100 @@ export const startMockOrg = async (options: MockOrgOptions = {}): Promise<MockOr
     },
     removeSetupEntityAccess: () => {
       setupAccess.clear();
+    },
+    seedProfile: (name, id) => {
+      const profileId = id ?? nextId("00e");
+      profiles.set(profileId, { Id: profileId, Name: name });
+      return profileId;
+    },
+    seedExternalClientApp: (fields) => {
+      const developerName = fields.developerName;
+      const id = nextId("0xI");
+      const consumerId = nextId("888");
+      const consumerKey = `3MVG9mock${consumerId}`;
+      const label = fields.label ?? developerName;
+      const contactEmail = fields.contactEmail ?? "admin@example.com";
+      const policyFullName = fields.policyFullName ?? `${developerName}_defaultPolicy`;
+      clientApps.set(developerName, { id, developerName, consumerId, consumerKey });
+      const application: Record<string, MetadataField> = {
+        contactEmail,
+        distributionState: "Local",
+        label,
+        orgScopedExternalApp: `${orgId}:${developerName}`,
+      };
+      if (fields.description !== undefined && fields.description !== null && fields.description.length > 0) {
+        application.description = fields.description;
+      }
+      putComponent("ExternalClientApplication", developerName, application);
+      putComponent("ExtlClntAppOauthSettings", `${developerName}_Oauth`, {
+        commaSeparatedOauthScopes: fields.scopes ?? "Api, RefreshToken",
+        externalClientApplication: developerName,
+        label: `${label} OAuth`,
+        oauthLink: `${orgId}:${consumerId}`,
+      });
+      const globalFields: Record<string, MetadataField> = {
+        callbackUrl: fields.callbackUrl ?? "https://example.com/callback",
+        consumerKey,
+        externalClientApplication: developerName,
+        isClientCredentialsFlowEnabled: fields.clientCredentials === true,
+        isEnforceRefreshTokenTTL: false,
+        isPkceRequired: fields.pkceRequired ?? true,
+        isRefreshTokenRotationEnabled: false,
+        label,
+        shouldRotateConsumerKey: false,
+        shouldRotateConsumerSecret: false,
+      };
+      if (fields.certificate !== undefined && fields.certificate !== null && fields.certificate.length > 0) {
+        globalFields.certificate = fields.certificate;
+      }
+      putComponent("ExtlClntAppGlobalOauthSettings", `${developerName}_GlblOauth`, globalFields);
+      const policyFields: Record<string, MetadataField> = {
+        externalClientApplication: developerName,
+        ipRelaxationPolicyType: fields.ipRelaxation ?? "Enforce",
+        isClientCredentialsFlowEnabled: fields.clientCredentials === true,
+        label: `${label} OAuth Policy`,
+        permittedUsersPolicyType: fields.permittedUsers ?? "AllSelfAuthorized",
+      };
+      if (fields.runAsUsername !== undefined) {
+        policyFields.clientCredentialsFlowUser = fields.runAsUsername;
+      }
+      if (fields.permissionSets !== undefined && fields.permissionSets.length > 0) {
+        policyFields.commaSeparatedPermissionSet = fields.permissionSets;
+      }
+      putComponent("ExtlClntAppOauthConfigurablePolicies", `${developerName}_OauthPlcy`, policyFields);
+      putComponent("ExtlClntAppConfigurablePolicies", policyFullName, {
+        externalClientApplication: developerName,
+        isEnabled: fields.enabled ?? true,
+        isOauthPluginEnabled: true,
+        label: `${label} Policy`,
+      });
+      return { id, consumerId, consumerKey };
+    },
+    externalClientApp: (developerName) => {
+      const app = clientApps.get(developerName);
+      if (app === undefined) {
+        return undefined;
+      }
+      const parts = [...metadataComponents.values()].filter((part) => {
+        if (part.type === "ExternalClientApplication") {
+          return part.fullName === developerName;
+        }
+        return part.fields.externalClientApplication === developerName;
+      });
+      return {
+        id: app.id,
+        consumerId: app.consumerId,
+        consumerKey: app.consumerKey,
+        policyFullName: parts.find((part) => part.type === "ExtlClntAppConfigurablePolicies")?.fullName,
+        parts: parts.map((part) => ({
+          type: part.type,
+          fullName: part.fullName,
+          fields: part.fields,
+        })),
+      };
+    },
+    setRotateConsumerKeyOnDeploy: (rotate) => {
+      rotateConsumerKeyOnDeploy = rotate;
     },
   };
 };

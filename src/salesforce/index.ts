@@ -7,6 +7,24 @@ export {
   type CspTrustedSiteProps,
 } from "./CspTrustedSite.js";
 export {
+  DELETION_POLICIES,
+  ExternalClientApp,
+  IP_RELAXATIONS,
+  REFRESH_TOKEN_POLICIES,
+  REFRESH_TOKEN_UNITS,
+  SESSION_LEVELS,
+  type DeletionPolicy,
+  type ExternalClientAppAttributes,
+  type ExternalClientAppInput,
+  type ExternalClientAppProps,
+  type IpRelaxation,
+  type PermittedUsers,
+  type RefreshTokenPolicy,
+  type RefreshTokenSettings,
+  type RefreshTokenUnit,
+  type SessionLevel,
+} from "./ExternalClientApp.js";
+export {
   AUTHENTICATION_PROTOCOLS,
   ExternalCredential,
   OAUTH_PROTOCOL_VARIANTS,

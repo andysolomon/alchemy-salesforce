@@ -1,7 +1,7 @@
 {
   "name": "alchemy-salesforce",
   "version": "0.1.1",
-  "description": "Alchemy provider for Salesforce org configuration: CSP trusted sites, remote sites, permission set assignments, external credentials, named credentials, and principal access.",
+  "description": "Alchemy provider for Salesforce org configuration: CSP trusted sites, remote sites, permission set assignments, external client apps, external credentials, named credentials, and principal access.",
   "type": "module",
   "license": "MIT",
   "repository": {

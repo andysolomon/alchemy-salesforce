@@ -23,6 +23,7 @@ import {
   type MaterializedCredential,
 } from "./credentialSecrets.js";
 import { isNotFound, redactApiError, SalesforceApiError, SalesforceValidationError } from "./errors.js";
+import { sha256Hex } from "./hash.js";
 import { requireDeveloperName } from "./names.js";
 import {
   PRINCIPAL_TYPES,
@@ -46,6 +47,15 @@ export interface ExternalCredentialSecretInput {
   readonly principalName: Input<string>;
   readonly principalType?: Input<PrincipalType>;
   readonly credentials: Readonly<Record<string, CredentialSpec | Redacted.Redacted<string> | string>>;
+  /**
+   * When set, `sha256(credentials.clientId)` must equal `consumerKeySha256`
+   * before any credential request is sent. A mismatch means the secret store
+   * is behind the External Client App.
+   */
+  readonly clientApp?: Input<{
+    readonly consumerKeySha256: string;
+    readonly consumerId: string;
+  }>;
 }
 
 export interface ExternalCredentialSecretProps {
@@ -57,6 +67,10 @@ export interface ExternalCredentialSecretProps {
   readonly encryptedKeys: ReadonlyArray<string>;
   /** SHA-256 of the credential names, encryption flags, and values. Not the secret. */
   readonly credentialsDigest: string;
+  readonly clientApp?: {
+    readonly consumerKeySha256: string;
+    readonly consumerId: string;
+  };
 }
 
 export interface ExternalCredentialSecretAttributes {
@@ -182,6 +196,7 @@ const declareSecret = (id: string, props: ExternalCredentialSecretInput) =>
       credentialKeys: credentials.map((item) => item.key),
       encryptedKeys: credentials.filter((item) => item.encrypted).map((item) => item.key),
       credentialsDigest: credentialsDigest(credentials),
+      ...(props.clientApp === undefined ? {} : { clientApp: props.clientApp }),
     });
   });
 
@@ -215,6 +230,51 @@ const requireSecrets = (logicalId: string, externalCredential: string, principal
     );
   }
   return Effect.succeed(secrets);
+};
+
+const assertClientApp = (
+  props: ExternalCredentialSecretProps,
+  credentials: ReadonlyArray<MaterializedCredential>,
+): Effect.Effect<void, SalesforceValidationError> => {
+  const clientApp = props.clientApp;
+  if (clientApp === undefined) {
+    return Effect.void;
+  }
+  if (!/^[0-9a-f]{64}$/.test(clientApp.consumerKeySha256)) {
+    return Effect.fail(
+      new SalesforceValidationError({
+        message: "clientApp.consumerKeySha256 must be a SHA-256 hex digest. The consumer key is not stored here.",
+      }),
+    );
+  }
+  if (clientApp.consumerId.trim().length === 0) {
+    return Effect.fail(
+      new SalesforceValidationError({
+        message: "clientApp.consumerId is required when clientApp is set.",
+      }),
+    );
+  }
+  const clientId = credentials.find((item) => item.key === "clientId");
+  if (clientId === undefined) {
+    return Effect.fail(
+      new SalesforceValidationError({
+        message:
+          "clientApp is set, but credentials do not include clientId. " +
+          "The comparison is sha256(credentials.clientId) against the External Client App consumer key hash.",
+      }),
+    );
+  }
+  if (sha256Hex(clientId.value) !== clientApp.consumerKeySha256) {
+    return Effect.fail(
+      new SalesforceValidationError({
+        message:
+          `Credential clientId for '${props.principalName}' on '${props.externalCredential}' ` +
+          "does not match the External Client App consumer key (sha256). " +
+          "The secret store is out of date. No credential request was sent, and the key is not included in this error.",
+      }),
+    );
+  }
+  return Effect.void;
 };
 
 const identityQuery = (props: ExternalCredentialSecretProps) => ({
@@ -317,6 +377,24 @@ export const ExternalCredentialSecretProvider = Provider.succeed(
       if (credentialSecretErrorFor(input.id) !== undefined) {
         return Effect.succeed(undefined);
       }
+      const known = credentialSecretsFor(input.id);
+      if (known !== undefined && input.olds.clientApp !== undefined) {
+        return assertClientApp(input.olds, known).pipe(
+          Effect.flatMap(() =>
+            scrub(
+              Effect.gen(function* () {
+                const connection = yield* connectionFor(input.olds.targetOrg);
+                const live = yield* readLive(connection, input.olds);
+                if (live === undefined) {
+                  return undefined;
+                }
+                return attributesFrom(input.olds, live.authenticationStatus);
+              }),
+              secretValues(known),
+            ),
+          ),
+        );
+      }
       return scrub(
         Effect.gen(function* () {
           const connection = yield* connectionFor(input.olds.targetOrg);
@@ -334,6 +412,10 @@ export const ExternalCredentialSecretProvider = Provider.succeed(
         if (!isResolved(input.news)) {
           return undefined;
         }
+        const known = credentialSecretsFor(input.id);
+        if (known !== undefined) {
+          yield* assertClientApp(input.news, known);
+        }
         const connection = yield* connectionFor(input.news.targetOrg);
         const live = yield* readLive(connection, input.news);
         if (live === undefined) {
@@ -350,6 +432,7 @@ export const ExternalCredentialSecretProvider = Provider.succeed(
         }
         const identity = yield* assertResolvedIdentity(input.news);
         const secrets = yield* requireSecrets(input.id, identity.externalCredential, identity.principalName);
+        yield* assertClientApp(identity, secrets);
         const values = secretValues(secrets);
         return yield* scrub(
           Effect.gen(function* () {

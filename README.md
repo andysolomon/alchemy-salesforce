@@ -1,6 +1,6 @@
 # alchemy-salesforce
 
-Alchemy provider for Salesforce org configuration. It manages CSP trusted sites, remote site settings, permission set assignments, external credentials, named credentials, credential secrets, and principal access.
+Alchemy provider for Salesforce org configuration. It manages CSP trusted sites, remote site settings, permission set assignments, external client apps, external credentials, named credentials, credential secrets, and principal access.
 
 The public surface matches Alchemy's built-in providers: an Effect `Layer` from `providers()`, and resource constructors you `yield*` inside a stack.
 
@@ -77,6 +77,7 @@ See `examples/single-org.ts` and `examples/multi-org.ts`.
 | `CspTrustedSite` | REST sObject `CspTrustedSite` | DELETE that row | SOQL / sObject retrieve |
 | `PermissionSetAssignment` | POST an assignment of an existing permission set to an existing user | DELETE that row (unassign) | SOQL. A new user or permission set is a replace |
 | `RemoteSiteSetting` | Tooling `RemoteProxy` via `FullName` + `Metadata` | DELETE, or deactivate when the API refuses DELETE | Tooling query on `SiteName` |
+| `ExternalClientApp` | Metadata API deploy of the five External Client App parts. Check-only, then the real deploy | `deletionPolicy: "retain"` (default) drops state and leaves the org. `"delete"` deploys `destructiveChanges.xml` | SOQL `ExternalClientApplication` (`0xI`), then SOAP `readMetadata`. `list` is the default org only |
 | `ExternalCredential` | Connect REST `POST` / `PUT /named-credentials/external-credentials` | DELETE that developer name (404 is already gone) | GET by developer name. `list` is the default org only |
 | `NamedCredential` | Connect REST `POST` / `PUT /named-credentials/named-credential-setup` | DELETE that developer name | GET by developer name. `list` is the default org only |
 | `ExternalCredentialSecret` | Connect REST `POST` when the principal has no credentials, otherwise `PUT /named-credentials/credential` | DELETE that principal's credential | GET. `list` is empty |
@@ -141,6 +142,60 @@ const remoteSite = yield* Salesforce.RemoteSiteSetting("ExampleRemote", {
   disableProtocolSecurity: false,
 });
 ```
+
+### `ExternalClientApp`
+
+External Client Apps have no REST or Tooling sObject create, update, or delete. They are five Metadata API parts:
+
+| Part | Full name |
+| --- | --- |
+| `ExternalClientApplication` | `developerName` |
+| `ExtlClntAppOauthSettings` | `<developerName>_Oauth` |
+| `ExtlClntAppGlobalOauthSettings` | `<developerName>_GlblOauth` |
+| `ExtlClntAppOauthConfigurablePolicies` | `<developerName>_OauthPlcy` |
+| `ExtlClntAppConfigurablePolicies` | Discovered. Some orgs use `<developerName>_Plcy`, others `<developerName>_defaultPolicy`. `listMetadata` plus `readMetadata` keeps the one whose `externalClientApplication` is this app |
+
+`readMetadata` and `listMetadata` are SOAP calls to `/services/Soap/m/<apiVersion>`. The access token is sent as `SessionHeader` and is not logged. Deploy is `POST /services/data/vXX/metadata/deployRequest` with a multipart body. The zip is built in memory and is not written to disk. Every deploy runs check-only first, then the real deploy. Deploys for one org run one at a time, because a Metadata deploy locks the org.
+
+Generated fields are copied from the fresh read onto any file that is deployed: `orgScopedExternalApp`, `oauthLink`, and `consumerKey`. A check-only deploy of that unmodified set reports the components unchanged. Stripping those fields reports them changed and can cause Salesforce to mint a new consumer key. `consumerSecret` is never returned and is never sent. `shouldRotateConsumerKey` and `shouldRotateConsumerSecret` are forced to `false`. There is no prop that turns them on.
+
+The org setting **Allow access to OAuth consumer secrets via Metadata API** must be enabled. Without it, global OAuth settings cannot be read or deployed, and the consumer key hash cannot be recorded. `readMetadata` returns that key in plaintext on the wire. Do not log the SOAP response, the deploy zip, or the poll body.
+
+State stores `consumerKeySha256` and, when JWT bearer is configured, `certificateSha256` of the public certificate body. It does not store the key, the secret, or the PEM. After every apply the provider reads the app again and fails if `consumerId` (`888…`) or the key hash changed.
+
+`developerName` and `targetOrg` are immutable. Changing either is a replace, and a replace creates a new consumer key and secret. The provider fails that plan unless `allowReplace` is `true`. `deletionPolicy` defaults to `retain`: destroy removes the resource from Alchemy state and leaves the org row. `delete` deploys destructive changes for every part, using the discovered policy full name.
+
+`clientCredentials.runAsUsername` and pre-authorized permission sets (and profiles) must already exist. This resource does not create them. `oauth.scopes` are split, trimmed, and sorted before compare, because Salesforce stores them as a single string such as `Api, RefreshToken`.
+
+```ts
+const app = yield* Salesforce.ExternalClientApp("PartnerApp", {
+  targetOrg: caller.alias,
+  developerName: "PartnerApp",
+  label: "Partner",
+  contactEmail: "admin@example.com",
+  oauth: {
+    scopes: ["Api", "RefreshToken"],
+    callbackUrl: "https://app.example.com/oauth/callback",
+    clientCredentials: { runAsUsername },
+    permittedUsers: { type: "AdminApprovedPreAuthorized", permissionSets: ["Example_Access"] },
+    ipRelaxation: "Enforce",
+    pkceRequired: true,
+  },
+});
+
+yield* Salesforce.ExternalCredentialSecret("PartnerSecret", {
+  targetOrg: caller.alias,
+  externalCredential: external.developerName,
+  principalName: "PartnerPrincipal",
+  credentials: {
+    clientId: { value: Redacted.make(clientId), encrypted: false },
+    clientSecret: { value: Redacted.make(clientSecret), encrypted: true },
+  },
+  clientApp: { consumerKeySha256: app.consumerKeySha256, consumerId: app.consumerId },
+});
+```
+
+`ExternalCredentialSecret.clientApp` is optional. When it is set, apply hashes `credentials.clientId` in memory and fails before any credential request if that hash is not `consumerKeySha256`. That is the check that a secret store such as Infisical is still the key for this app.
 
 ### `ExternalCredential`
 
@@ -226,7 +281,7 @@ yield* Salesforce.ExternalCredentialSecret("PartnerSecret", {
 });
 ```
 
-On the target org, create an External Client App (or Connected App) that allows the OAuth client-credentials flow, has a Run As user, and includes the `api` scope. The token URL is that org's My Domain plus `/services/oauth2/token`.
+On the target org, the OAuth client is an External Client App (or a Connected App) that allows the client-credentials flow, has a Run As user, and includes the `api` scope. The token URL is that org's My Domain plus `/services/oauth2/token`. Pass `clientApp` from `Salesforce.ExternalClientApp` so apply refuses to send `clientId` when its SHA-256 is not the app's `consumerKeySha256`.
 
 Deploy without the secret first if you want. The external credential stays `NotConfigured` and the named credential still exists. Supply the credential values and deploy again to bind them. Removing the secret resource on a later deploy deletes that principal's credential.
 
@@ -284,6 +339,7 @@ These showed up against live API 66 and 68 and are enforced in the provider:
 - **List scope.** CSP, assignment, remote site, external credential, and named credential `list` read the **default** org only. Secret and principal-access `list` are empty. Nuke stays skipped so a mesh cannot wipe every credential in an org.
 - **SOQL.** String literals are escaped, including quotes. This is not a general SOQL builder.
 - **Permission set definitions** are not created here. Tooling `PermissionSet` does not support create. Deploy the definition with `sf project deploy`, and use this provider to assign it.
+- **External Client Apps** are Metadata API only. Enable **Allow access to OAuth consumer secrets via Metadata API** or global OAuth settings cannot be read or deployed. `readMetadata` returns the consumer key in plaintext. Do not log that response. State stores the SHA-256 only. `consumerSecret` is never read or sent. Deploys copy `consumerKey`, `oauthLink`, and `orgScopedExternalApp` from the fresh read and force both rotate flags to false.
 
 ## When to use `sf project deploy` instead
 
